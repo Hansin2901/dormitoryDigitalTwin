@@ -14,10 +14,12 @@ def seed(days: int = 7):
 
     Args:
         days: Number of days of data to generate (default: 7)
+
     """
-    # Time range: last N days up to now
-    end_time = datetime.now().replace(second=0, microsecond=0)
-    start_time = end_time - timedelta(days=days)
+    # Time range: start from midnight, N days ago
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_time = today - timedelta(days=days - 1)  # Start from midnight N-1 days ago
+    end_time = today + timedelta(days=1) - timedelta(minutes=5)  # End at 23:55 today
 
     print(f"Generating {days} days of sensor data...")
     print(f"  Start: {start_time}")
@@ -102,5 +104,10 @@ def verify():
 
 
 if __name__ == "__main__":
-    seed()
+    import argparse
+    parser = argparse.ArgumentParser(description="Seed InfluxDB with sensor data")
+    parser.add_argument("--days", type=int, default=7, help="Number of days of data")
+    args = parser.parse_args()
+
+    seed(days=args.days, clear=args.clear)
     verify()
