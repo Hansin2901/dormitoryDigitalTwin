@@ -1,3 +1,7 @@
 neo4j>=5.0.0
 influxdb3-python>=0.17.0
 python-dotenv>=1.0.0
+google-generativeai>=0.8.0
+langfuse>=2.0.0
+streamlit>=1.40.0
+pandas>=2.3.3

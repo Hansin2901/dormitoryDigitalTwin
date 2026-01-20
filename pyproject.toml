@@ -11,4 +11,8 @@ dependencies = [
     "numpy>=2.4.1",
     "pandas>=2.3.3",
     "python-dotenv>=1.0.0",
+    # Chat interface dependencies
+    "google-generativeai>=0.8.0",
+    "langfuse>=2.0.0",
+    "streamlit>=1.40.0",
 ]
