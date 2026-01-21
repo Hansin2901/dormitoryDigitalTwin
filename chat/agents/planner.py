@@ -17,7 +17,7 @@ from chat.tools import execute_cypher, execute_sql
 TOOLS = [
     {
         "name": "execute_cypher",
-        "description": "Execute a Cypher query against Neo4j graph database. Use for questions about relationships, topology, which AC services which room, what sensors are in a room, etc.",
+        "description": "Execute a Cypher query against Neo4j graph database. Use for questions about relationships, topology, for example which AC services, which room, what sensors are in a room, etc. Should also be used to look up sensor IDs before querying time-series data.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -31,7 +31,7 @@ TOOLS = [
     },
     {
         "name": "execute_sql",
-        "description": "Execute a SQL query against InfluxDB time-series database. Use for questions about sensor readings over time, temperatures, occupancy patterns, averages, etc.",
+        "description": "Execute a SQL query against InfluxDB time-series database. Use for questions about sensor readings over time, temperatures, occupancy patterns, averages, etc. Note if you need the senssor ID you will have to query the graph database with using the room numbers to obtain the sensor IDs in them.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -88,37 +88,43 @@ class PlannerAgent:
         self.max_iterations = 10
 
     def _execute_tool(self, tool_name: str, tool_input: dict, trace: Any = None) -> dict:
-        """Execute a tool and return the result."""
-        tool_span = None
-        if trace:
-            try:
-                tool_span = trace.span(name=f"tool_{tool_name}", input=tool_input)
-            except Exception:
-                pass
-
+        """Execute a tool and return the result (legacy method without tracing)."""
         try:
             tool_func = TOOL_FUNCTIONS.get(tool_name)
             if not tool_func:
-                result = {"success": False, "error": f"Unknown tool: {tool_name}"}
-            else:
-                result = tool_func(**tool_input)
-
-            if tool_span:
-                try:
-                    tool_span.end(output=result)
-                except Exception:
-                    pass
-
-            return result
-
+                return {"success": False, "error": f"Unknown tool: {tool_name}"}
+            return tool_func(**tool_input)
         except Exception as e:
-            error_result = {"success": False, "error": str(e)}
-            if tool_span:
-                try:
-                    tool_span.end(output=error_result, level="ERROR")
-                except Exception:
-                    pass
-            return error_result
+            return {"success": False, "error": str(e)}
+
+    def _execute_tool_with_span(self, tool_name: str, tool_input: dict, trace: Any = None) -> dict:
+        """Execute a tool with Langfuse tool observation tracing."""
+        if trace:
+            try:
+                with trace.tool_span(
+                    name=f"tool_{tool_name}",
+                    input_data=tool_input,
+                    metadata={"tool": tool_name}
+                ) as tool_obs:
+                    try:
+                        tool_func = TOOL_FUNCTIONS.get(tool_name)
+                        if not tool_func:
+                            result = {"success": False, "error": f"Unknown tool: {tool_name}"}
+                        else:
+                            result = tool_func(**tool_input)
+
+                        tool_obs.update(output=result)
+                        return result
+
+                    except Exception as e:
+                        error_result = {"success": False, "error": str(e)}
+                        tool_obs.update(output=error_result)
+                        return error_result
+            except Exception:
+                # Fall back to untraced execution if span fails
+                pass
+
+        return self._execute_tool(tool_name, tool_input)
 
     def _format_tool_result(self, result: dict) -> str:
         """Format tool result for the LLM context."""
@@ -148,94 +154,140 @@ class PlannerAgent:
         trace = self.llm.create_trace(
             name="agent_run",
             user_id=user_id,
-            metadata={"query": user_query}
+            metadata={},
+            input_data={"query": user_query}
         )
 
         response = AgentResponse()
         messages = [{"role": "user", "content": user_query}]
 
-        for iteration in range(self.max_iterations):
-            iter_span = trace.span(
-                name=f"iteration_{iteration + 1}",
-                metadata={"iteration": iteration + 1}
-            )
+        # Use trace as context manager for proper v3 API usage
+        with trace:
+            for iteration in range(self.max_iterations):
+                print(f"[Agent] Starting iteration {iteration + 1}")
 
-            try:
-                llm_response = self.llm.generate_with_tools(
-                    system_prompt=PLANNER_SYSTEM_PROMPT,
-                    messages=messages,
-                    tools=TOOLS,
-                    parent_trace=iter_span
-                )
+                # Use span as context manager with input data
+                with trace.span(
+                    name=f"iteration_{iteration + 1}",
+                    input_data={"messages": messages.copy()},
+                    metadata={"iteration": iteration + 1}
+                ) as iter_span:
+                    try:
+                        print(f"[Agent] Calling LLM with {len(messages)} messages")
 
-                # Check if LLM called a tool
-                if "function_call" in llm_response:
-                    func_call = llm_response["function_call"]
-                    tool_name = func_call["name"]
-                    tool_input = func_call["arguments"]
+                        # Build messages array with system prompt for tracing
+                        trace_messages = [
+                            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                            *[{"role": m["role"], "content": m.get("content", str(m))} for m in messages]
+                        ]
 
-                    # Execute tool
-                    tool_result = self._execute_tool(tool_name, tool_input, trace)
+                        # Wrap LLM call in generation observation
+                        with trace.generation(
+                            name="llm_call",
+                            model=self.llm.model_name,
+                            input_data=trace_messages,
+                            metadata={"tools": TOOLS}
+                        ) as gen:
+                            llm_response = self.llm.generate_with_tools(
+                                system_prompt=PLANNER_SYSTEM_PROMPT,
+                                messages=messages,
+                                tools=TOOLS,
+                                parent_trace=iter_span
+                            )
+                            gen.update(output=llm_response)
 
-                    # Record step
-                    step = AgentStep(
-                        thought=f"Calling {tool_name}",
-                        tool_name=tool_name,
-                        tool_input=tool_input,
-                        tool_result=tool_result
-                    )
-                    response.steps.append(step)
+                        print(f"[Agent] LLM response keys: {llm_response.keys()}")
 
-                    # Add to conversation for next iteration
-                    formatted_result = self._format_tool_result(tool_result)
-                    messages.append({
-                        "role": "model",
-                        "content": f"Calling {tool_name}"
-                    })
-                    messages.append({
-                        "role": "function",
-                        "name": tool_name,
-                        "content": formatted_result
-                    })
+                        # Check if LLM called a tool
+                        if "function_call" in llm_response:
+                            func_call = llm_response["function_call"]
+                            tool_name = func_call["name"]
+                            tool_input = func_call["arguments"]
 
-                    iter_span.end(output={"tool_called": tool_name, "success": tool_result.get("success")})
+                            # Execute tool within its own span
+                            tool_result = self._execute_tool_with_span(tool_name, tool_input, trace)
 
-                else:
-                    # Got a text response
-                    content = llm_response.get("content", "")
+                            # Record step
+                            step = AgentStep(
+                                thought=f"Calling {tool_name}",
+                                tool_name=tool_name,
+                                tool_input=tool_input,
+                                tool_result=tool_result
+                            )
+                            response.steps.append(step)
 
-                    # Check if model described intent without calling
-                    if self._looks_like_intent_without_call(content) and iteration < self.max_iterations - 1:
-                        # Nudge model to actually call the tool
-                        messages.append({"role": "model", "content": content})
-                        messages.append({
-                            "role": "user",
-                            "content": "Please actually call the tool now with a query. Don't describe what you'll do - execute the function."
-                        })
-                        iter_span.end(output={"nudged_to_call": True})
-                        continue
+                            # Add to conversation for next iteration
+                            formatted_result = self._format_tool_result(tool_result)
+                            messages.append({
+                                "role": "model",
+                                "content": f"Calling {tool_name}"
+                            })
+                            messages.append({
+                                "role": "function",
+                                "name": tool_name,
+                                "content": formatted_result
+                            })
 
-                    # It's a final answer
-                    response.final_answer = content
-                    iter_span.end(output={"final_answer": True})
-                    break
+                            iter_span.update(output={
+                                "action": "tool_call",
+                                "tool_name": tool_name,
+                                "tool_input": tool_input,
+                                "tool_result": tool_result
+                            })
 
-            except Exception as e:
-                iter_span.end(output={"error": str(e)}, level="ERROR")
-                response.final_answer = f"Error: {str(e)}"
-                break
+                        else:
+                            # Got a text response
+                            content = llm_response.get("content", "")
 
-        else:
-            # Max iterations reached
-            if response.steps:
-                response.final_answer = "I gathered some data but couldn't complete the analysis. Please see the results above."
+                            # Check if model described intent without calling
+                            if self._looks_like_intent_without_call(content) and iteration < self.max_iterations - 1:
+                                # Nudge model to actually call the tool
+                                messages.append({"role": "model", "content": content})
+                                messages.append({
+                                    "role": "user",
+                                    "content": "Please actually call the tool now with a query. Don't describe what you'll do - execute the function."
+                                })
+                                iter_span.update(output={
+                                    "action": "nudge",
+                                    "llm_response": content
+                                })
+                                continue
+
+                            # It's a final answer
+                            response.final_answer = content
+                            iter_span.update(output={
+                                "action": "final_answer",
+                                "answer": content
+                            })
+                            break
+
+                    except Exception as e:
+                        print(f"[Agent] Error in iteration {iteration + 1}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        iter_span.update(output={"error": str(e)})
+                        response.final_answer = f"Error: {str(e)}"
+                        break
+
             else:
-                response.final_answer = "I wasn't able to answer your question."
+                # Max iterations reached
+                if response.steps:
+                    response.final_answer = "I gathered some data but couldn't complete the analysis. Please see the results above."
+                else:
+                    response.final_answer = "I wasn't able to answer your question."
 
-        try:
-            response.trace_url = trace.get_trace_url()
-        except Exception:
-            pass
+            # Set the final output on the root trace
+            trace.set_output({
+                "final_answer": response.final_answer,
+                "steps_count": len(response.steps),
+                "tools_used": [s.tool_name for s in response.steps if s.tool_name]
+            })
+
+            # Get trace URL while still inside the context
+            try:
+                response.trace_url = trace.get_trace_url()
+            except Exception:
+                pass
 
         self.llm.flush()
         return response

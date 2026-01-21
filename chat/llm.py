@@ -5,7 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import os
-from typing import Any
+from contextlib import contextmanager
+from typing import Any, Generator
 
 import google.generativeai as genai
 from google.generativeai.types import FunctionDeclaration, Tool
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Try to import Langfuse v3
+# Initialize Langfuse v3 client
 LANGFUSE_AVAILABLE = False
 langfuse_client = None
 
@@ -25,16 +26,25 @@ try:
     secret_key = os.getenv("LANGFUSE_SECRET_KEY")
 
     if public_key and secret_key:
-        # Set env vars for Langfuse
         os.environ["LANGFUSE_PUBLIC_KEY"] = public_key
         os.environ["LANGFUSE_SECRET_KEY"] = secret_key
-        host = os.getenv("LANGFUSE_HOST")
+        # Support both LANGFUSE_HOST (legacy) and LANGFUSE_BASE_URL (official)
+        host = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST")
         if host:
             os.environ["LANGFUSE_HOST"] = host
+            os.environ["LANGFUSE_BASE_URL"] = host
 
         langfuse_client = get_client()
-        LANGFUSE_AVAILABLE = True
-        print("Langfuse tracing enabled")
+
+        # Verify authentication
+        try:
+            if langfuse_client.auth_check():
+                LANGFUSE_AVAILABLE = True
+                print("Langfuse tracing enabled")
+            else:
+                print("Langfuse authentication failed - tracing disabled")
+        except Exception as auth_err:
+            print(f"Langfuse authentication error: {auth_err}")
 except Exception as e:
     print(f"Langfuse not available: {e}")
 
@@ -42,13 +52,8 @@ except Exception as e:
 class GeminiClient:
     """Wrapper for Google Gemini API with function calling and optional Langfuse tracing."""
 
-    def __init__(self, model: str = "gemini-2.5-flash"):
-        """
-        Initialize the Gemini client with optional Langfuse tracing.
-
-        Args:
-            model: Gemini model to use
-        """
+    def __init__(self, model: str = "gemini-3-flash-preview"):
+        """Initialize the Gemini client."""
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY environment variable is required")
@@ -68,13 +73,11 @@ class GeminiClient:
                 parameters=tool["parameters"]
             )
             function_declarations.append(func_decl)
-
         return [Tool(function_declarations=function_declarations)]
 
     def _build_contents(self, messages: list[dict]) -> list[dict]:
         """Build Gemini content format from messages."""
         contents = []
-
         for msg in messages:
             role = msg["role"]
             if role == "user":
@@ -91,7 +94,6 @@ class GeminiClient:
                         }
                     }]
                 })
-
         return contents
 
     def generate_with_tools(
@@ -101,14 +103,7 @@ class GeminiClient:
         tools: list[dict],
         parent_trace: Any = None
     ) -> dict:
-        """
-        Generate a response with function calling.
-
-        Returns:
-            dict with either:
-            - 'content': text response (final answer)
-            - 'function_call': {"name": "...", "arguments": {...}}
-        """
+        """Generate a response with function calling."""
         try:
             gemini_tools = self._convert_tools_to_gemini_format(tools)
 
@@ -129,38 +124,59 @@ class GeminiClient:
                 tool_config=tool_config
             )
 
+            # Check for empty response
+            if not response.candidates:
+                print(f"[LLM] Warning: No candidates in response")
+                # Check if there's a prompt feedback (safety block, etc.)
+                if hasattr(response, 'prompt_feedback'):
+                    print(f"[LLM] Prompt feedback: {response.prompt_feedback}")
+                return {"content": "I was unable to generate a response. The model returned no candidates."}
+
             candidate = response.candidates[0]
+
+            # Check for finish reason that might indicate an issue
+            if hasattr(candidate, 'finish_reason'):
+                print(f"[LLM] Finish reason: {candidate.finish_reason}")
+
+            # Check for empty content
+            if not hasattr(candidate, 'content') or not candidate.content:
+                print(f"[LLM] Warning: No content in candidate")
+                return {"content": "I was unable to generate a response. The model returned empty content."}
+
+            # Check for empty parts
+            if not candidate.content.parts:
+                print(f"[LLM] Warning: No parts in content")
+                return {"content": "I was unable to generate a response. The model returned no parts."}
+
             part = candidate.content.parts[0]
 
             if hasattr(part, 'function_call') and part.function_call.name:
                 func_call = part.function_call
-                result = {
+                print(f"[LLM] Function call: {func_call.name}")
+                return {
                     "function_call": {
                         "name": func_call.name,
                         "arguments": dict(func_call.args) if func_call.args else {}
                     }
                 }
             elif hasattr(part, 'text') and part.text:
-                result = {"content": part.text}
+                print(f"[LLM] Text response: {part.text[:100]}...")
+                return {"content": part.text}
             else:
                 try:
-                    result = {"content": response.text}
+                    return {"content": response.text}
                 except Exception:
-                    result = {"content": "I was unable to generate a response."}
-
-            return result
+                    return {"content": "I was unable to generate a response."}
 
         except Exception as e:
+            print(f"[LLM] Error in generate_with_tools: {e}")
+            import traceback
+            traceback.print_exc()
             raise
 
-    def create_trace(self, name: str, user_id: str | None = None, metadata: dict | None = None):
-        """
-        Create a new trace for an agent run using Langfuse v3 API.
-
-        Returns:
-            TraceContext object for managing the trace
-        """
-        return TraceContext(self.langfuse, name, user_id, metadata)
+    def create_trace(self, name: str, user_id: str | None = None, metadata: dict | None = None, input_data: Any = None):
+        """Create a trace context for an agent run."""
+        return TraceContext(self.langfuse, name, user_id, metadata, input_data)
 
     def flush(self):
         """Flush pending Langfuse events."""
@@ -172,66 +188,186 @@ class GeminiClient:
 
 
 class TraceContext:
-    """Context manager for Langfuse traces using v3 API."""
+    """
+    Wrapper for Langfuse trace using v3 API.
 
-    def __init__(self, langfuse, name: str, user_id: str | None = None, metadata: dict | None = None):
+    In Langfuse v3, tracing uses OpenTelemetry-style context managers.
+    The proper pattern is:
+        with client.start_as_current_span(name="root") as root:
+            with client.start_as_current_span(name="child") as child:
+                # work here
+    """
+
+    def __init__(self, langfuse, name: str, user_id: str | None = None, metadata: dict | None = None, input_data: Any = None):
         self.langfuse = langfuse
         self.name = name
         self.user_id = user_id
         self.metadata = metadata or {}
-        self._observation = None
-        self._trace_url = None
-
-    def span(self, name: str = "", metadata: dict | None = None):
-        """Create a span within this trace."""
-        if self.langfuse and LANGFUSE_AVAILABLE:
-            try:
-                obs = self.langfuse.start_as_current_observation(
-                    as_type="span",
-                    name=name,
-                    metadata=metadata or {}
-                )
-                return SpanContext(obs)
-            except Exception as e:
-                print(f"Failed to create span: {e}")
-        return DummySpan()
-
-    def get_trace_url(self):
-        """Get the URL to view this trace in Langfuse."""
-        return self._trace_url
-
-
-class SpanContext:
-    """Context manager for Langfuse spans."""
-
-    def __init__(self, observation):
-        self.observation = observation
+        self.input_data = input_data
+        self._trace_id = None
+        self._root_span = None
+        self._root_ctx = None
 
     def __enter__(self):
-        if self.observation:
-            self.observation.__enter__()
+        """Start the root span when entering context."""
+        if self.langfuse and LANGFUSE_AVAILABLE:
+            try:
+                self._root_ctx = self.langfuse.start_as_current_span(
+                    name=self.name,
+                    input=self.input_data,
+                    metadata=self.metadata
+                )
+                self._root_span = self._root_ctx.__enter__()
+                if self.user_id:
+                    self._root_span.update(user_id=self.user_id)
+            except Exception as e:
+                print(f"Failed to start trace: {e}")
         return self
 
     def __exit__(self, *args):
-        if self.observation:
-            self.observation.__exit__(*args)
-
-    def end(self, output: Any = None, **kwargs):
-        """End the span with output."""
-        if self.observation:
+        """End the root span when exiting context."""
+        if self._root_ctx:
             try:
-                self.observation.update(output=output)
+                self._root_ctx.__exit__(*args)
             except Exception:
                 pass
+
+    def set_output(self, output: Any):
+        """Set output on the root span."""
+        if self._root_span:
+            try:
+                self._root_span.update(output=output)
+            except Exception:
+                pass
+
+    @contextmanager
+    def span(self, name: str = "", input_data: Any = None, metadata: dict | None = None) -> Generator["SpanWrapper", None, None]:
+        """Create a child span within the trace using context manager."""
+        if self.langfuse and LANGFUSE_AVAILABLE:
+            try:
+                with self.langfuse.start_as_current_span(
+                    name=name,
+                    input=input_data,
+                    metadata=metadata or {}
+                ) as span_ctx:
+                    yield SpanWrapper(span_ctx)
+                return
+            except Exception as e:
+                print(f"Failed to create span: {e}")
+        yield DummySpan()
+
+    @contextmanager
+    def generation(
+        self,
+        name: str = "llm-call",
+        model: str = "",
+        input_data: Any = None,
+        model_parameters: dict | None = None,
+        metadata: dict | None = None
+    ) -> Generator["GenerationWrapper", None, None]:
+        """Create a generation observation for LLM calls."""
+        if self.langfuse and LANGFUSE_AVAILABLE:
+            try:
+                with self.langfuse.start_as_current_generation(
+                    name=name,
+                    model=model,
+                    input=input_data,
+                    model_parameters=model_parameters or {},
+                    metadata=metadata or {}
+                ) as gen_ctx:
+                    yield GenerationWrapper(gen_ctx)
+                return
+            except Exception as e:
+                print(f"Failed to create generation: {e}")
+        yield DummySpan()
+
+    @contextmanager
+    def tool_span(
+        self,
+        name: str = "",
+        input_data: Any = None,
+        metadata: dict | None = None
+    ) -> Generator["SpanWrapper", None, None]:
+        """Create a tool observation for tool executions."""
+        if self.langfuse and LANGFUSE_AVAILABLE:
+            try:
+                with self.langfuse.start_as_current_observation(
+                    as_type="tool",
+                    name=name,
+                    input=input_data,
+                    metadata=metadata or {}
+                ) as tool_ctx:
+                    yield SpanWrapper(tool_ctx)
+                return
+            except Exception as e:
+                print(f"Failed to create tool span: {e}")
+        yield DummySpan()
+
+    def get_trace_url(self):
+        """Get URL to view trace in Langfuse."""
+        if self.langfuse and LANGFUSE_AVAILABLE:
+            try:
+                trace_id = self.langfuse.get_current_trace_id()
+                if trace_id:
+                    self._trace_id = trace_id
+                    host = os.getenv("LANGFUSE_BASE_URL") or os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com")
+                    return f"{host}/trace/{trace_id}"
+            except Exception:
+                pass
+        return None
+
+
+class SpanWrapper:
+    """Wrapper for Langfuse span to provide a consistent interface."""
+
+    def __init__(self, span):
+        self._span = span
+
+    def update(self, output: Any = None, **kwargs):
+        """Update span with output or other attributes."""
+        if self._span:
+            try:
+                self._span.update(output=output, **kwargs)
+            except Exception:
+                pass
+
+    def end(self, output: Any = None, **kwargs):
+        """End is a no-op in v3 API - spans end when context exits."""
+        # Update with final output if provided
+        if output is not None:
+            self.update(output=output, **kwargs)
+
+
+class GenerationWrapper:
+    """Wrapper for Langfuse generation observation to provide a consistent interface."""
+
+    def __init__(self, generation):
+        self._generation = generation
+
+    def update(self, output: Any = None, usage: dict | None = None, **kwargs):
+        """Update generation with output, usage stats, or other attributes."""
+        if self._generation:
+            try:
+                update_kwargs = {}
+                if output is not None:
+                    update_kwargs["output"] = output
+                if usage is not None:
+                    update_kwargs["usage"] = usage
+                update_kwargs.update(kwargs)
+                self._generation.update(**update_kwargs)
+            except Exception:
+                pass
+
+    def end(self, output: Any = None, usage: dict | None = None, **kwargs):
+        """End is a no-op in v3 API - generations end when context exits."""
+        if output is not None or usage is not None:
+            self.update(output=output, usage=usage, **kwargs)
 
 
 class DummySpan:
     """Dummy span when Langfuse is not available."""
 
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *args):
+    def update(self, **kwargs):
         pass
 
     def end(self, **kwargs):
