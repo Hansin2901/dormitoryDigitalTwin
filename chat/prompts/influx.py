@@ -109,6 +109,9 @@
 # """
 
 # Example queries for few-shot prompting
+# NOTE: These examples avoid now() since the data is static.
+# Use ORDER BY time DESC LIMIT 1 for "current" readings.
+# Use subqueries with MAX(time) for relative time ranges.
 INFLUX_EXAMPLES = [
     {
         "question": "What is the current temperature in room 101?",
@@ -119,37 +122,33 @@ ORDER BY time DESC
 LIMIT 1"""
     },
     {
-        "question": "What was the average temperature in room 103 yesterday?",
+        "question": "What was the average temperature in room 103 over the last day?",
         "query": """SELECT AVG(reading) as avg_temperature
 FROM sensor_readings
 WHERE sensor_id = 'TEMP-103'
-  AND time > now() - interval '2 days'
-  AND time < now() - interval '1 day'"""
+  AND time > (SELECT MAX(time) FROM sensor_readings) - interval '1 day'"""
     },
     {
-        "question": "Show the occupancy pattern for room 105 over the last 24 hours",
+        "question": "Show the occupancy pattern for room 105",
         "query": """SELECT time, reading as occupied
 FROM sensor_readings
 WHERE sensor_id = 'OCC-105'
-  AND time > now() - interval '1 day'
+  AND time > (SELECT MAX(time) FROM sensor_readings) - interval '1 day'
 ORDER BY time"""
     },
     {
-        "question": "Which room had the highest temperature in the last hour?",
-        "query": """SELECT sensor_id, MAX(reading) as max_temp
+        "question": "Which room had the highest temperature recently?",
+        "query": """SELECT sensor_id, reading as temperature, time
 FROM sensor_readings
 WHERE sensor_type = 'temperature'
-  AND time > now() - interval '1 hour'
-GROUP BY sensor_id
-ORDER BY max_temp DESC
-LIMIT 1"""
+ORDER BY time DESC
+LIMIT 6"""
     },
     {
-        "question": "What percentage of time was room 102 occupied today?",
+        "question": "What percentage of time was room 102 occupied?",
         "query": """SELECT AVG(reading) * 100 as occupancy_percent
 FROM sensor_readings
-WHERE sensor_id = 'OCC-102'
-  AND time > now() - interval '1 day'"""
+WHERE sensor_id = 'OCC-102'"""
     },
     {
         "question": "Show hourly temperature trends for room 104",
@@ -160,7 +159,7 @@ WHERE sensor_id = 'OCC-102'
   MAX(reading) as max_temp
 FROM sensor_readings
 WHERE sensor_id = 'TEMP-104'
-  AND time > now() - interval '1 day'
+  AND time > (SELECT MAX(time) FROM sensor_readings) - interval '1 day'
 GROUP BY DATE_BIN('1 hour', time)
 ORDER BY hour"""
     },
@@ -179,19 +178,31 @@ You are querying a database named `sensor_data` with a measurement `sensor_readi
   - `time` (timestamp): The time of the reading.
 
 ## Critical Rules
-1.  **Always Filter by Time:** You MUST include a `WHERE time > ...` clause. 
-2.  **Standard SQL Only:** Do NOT use InfluxQL (legacy) functions like `MEAN()` or `LAST()`. Use standard SQL `AVG()`, `MAX()`, `MIN()`.
-3.  **Bucketing:** Use `DATE_BIN('interval', time)` for histograms or trends (e.g., `DATE_BIN('1 hour', time)`).
+1.  **Standard SQL Only:** Do NOT use InfluxQL (legacy) functions like `MEAN()` or `LAST()`. Use standard SQL `AVG()`, `MAX()`, `MIN()`.
+2.  **Bucketing:** Use `DATE_BIN('interval', time)` for histograms or trends (e.g., `DATE_BIN('1 hour', time)`).
+3.  **For "current" readings:** Use `ORDER BY time DESC LIMIT 1` instead of time filters.
+4.  **For time ranges:** Use subqueries like `time > (SELECT MAX(time) FROM sensor_readings) - interval '1 day'`.
 
-## Aggregation Examples
-- **Hourly Average:**
+## Query Examples
+- **Latest/Current reading:**
+  ```sql
+  SELECT reading, time FROM sensor_readings
+  WHERE sensor_id = 'TEMP-101'
+  ORDER BY time DESC LIMIT 1
+  ```
+
+- **Hourly Average (last day of data):**
   ```sql
   SELECT DATE_BIN('1 hour', time) as hour_bucket, AVG(reading)
   FROM sensor_readings
-  WHERE sensor_id = 'TEMP-101' AND time > now() - interval '1 day'
-  GROUP BY 1 ORDER BY 1O
-  occupancy % (0 or 1):
-SQL
-SELECT AVG(reading) * 100 as percent_occupied
-FROM sensor_readings
-WHERE sensor_id = 'OCC-101'"""
+  WHERE sensor_id = 'TEMP-101'
+    AND time > (SELECT MAX(time) FROM sensor_readings) - interval '1 day'
+  GROUP BY 1 ORDER BY 1
+  ```
+
+- **Occupancy percentage:**
+  ```sql
+  SELECT AVG(reading) * 100 as percent_occupied
+  FROM sensor_readings
+  WHERE sensor_id = 'OCC-101'
+  ```"""

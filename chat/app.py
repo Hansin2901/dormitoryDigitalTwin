@@ -91,26 +91,34 @@ def main():
         st.markdown("### Example Questions")
 
         st.markdown("**Graph queries** (Neo4j)")
-        if st.button("Which AC unit services room 101?", key="ex1"):
-            st.session_state.pending_query = "Which AC unit services room 101?"
-        if st.button("What sensors are in room 103?", key="ex2"):
-            st.session_state.pending_query = "What sensors are in room 103?"
-        if st.button("List all rooms serviced by AC-1", key="ex3"):
-            st.session_state.pending_query = "List all rooms serviced by AC-1"
+        if st.button("Which AC unit services room 103?", key="ex1"):
+            st.session_state.pending_query = "Which AC unit services room 103?"
+        if st.button("What sensors are installed in room 101?", key="ex2"):
+            st.session_state.pending_query = "What sensors are installed in room 101?"
+        if st.button("What rooms are serviced by which Air Conditioning Units?", key="ex3"):
+            st.session_state.pending_query = "What rooms are serviced by which Air Conditioning Units?"
 
         st.markdown("**Time-series queries** (InfluxDB)")
-        if st.button("What's the current temperature in room 101?", key="ex4"):
-            st.session_state.pending_query = "What's the current temperature in room 101?"
-        if st.button("Show temperature trend for room 105 today", key="ex5"):
-            st.session_state.pending_query = "Show temperature trend for room 105 today"
-        if st.button("Which room is hottest right now?", key="ex6"):
-            st.session_state.pending_query = "Which room is hottest right now?"
+        if st.button("What's the latest temperature in room 105?", key="ex4"):
+            st.session_state.pending_query = "What's the latest temperature in room 105?"
+        if st.button("What are the typical occupancy patterns for the dorms?", key="ex5"):
+            st.session_state.pending_query = "What are the typical occupancy patterns for the dorms?"
+        if st.button("Which room has the highest temperature recently?", key="ex6"):
+            st.session_state.pending_query = "Which room has the highest temperature in the most recent readings?"
 
         st.markdown("**Hybrid queries**")
-        if st.button("Find rooms over 25°C and their AC units", key="ex7"):
-            st.session_state.pending_query = "Find rooms that are currently over 25°C and tell me which AC units service them"
-        if st.button("Compare sun vs shade room temps", key="ex8"):
-            st.session_state.pending_query = "Compare the average temperatures of sun-facing rooms vs shade-facing rooms over the last hour"
+        if st.button("Which occupied rooms are over 25°C?", key="ex7"):
+            st.session_state.pending_query = "Which occupied rooms have temperatures above 25°C?"
+        if st.button("Show all rooms with their latest temperatures", key="ex8"):
+            st.session_state.pending_query = "Show me all rooms with their latest temperatures"
+        if st.button("What times of day are we observing hot temperatures?", key="ex9"):
+            st.session_state.pending_query = "What times of day are we observing hot temperatures? In which dorm rooms? Are these rooms related to an Air Conditioning Unit?"
+
+        st.markdown("**Graceful failure tests**")
+        if st.button("What's the temperature in room 999?", key="ex10"):
+            st.session_state.pending_query = "What's the temperature in room 999?"
+        if st.button("Delete all temperature readings", key="ex11"):
+            st.session_state.pending_query = "Delete all temperature readings"
 
         st.divider()
         st.markdown("### About")

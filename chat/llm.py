@@ -83,7 +83,20 @@ class GeminiClient:
             if role == "user":
                 contents.append({"role": "user", "parts": [msg["content"]]})
             elif role == "model" or role == "assistant":
-                contents.append({"role": "model", "parts": [msg["content"]]})
+                if "raw_content" in msg:
+                    # Use raw content directly (preserves thought_signature for thinking models)
+                    contents.append(msg["raw_content"])
+                elif "function_call" in msg:
+                    # Fallback: reconstruct function call (may not work with thinking models)
+                    from google.generativeai.protos import FunctionCall
+                    fc = msg["function_call"]
+                    contents.append({
+                        "role": "model",
+                        "parts": [FunctionCall(name=fc["name"], args=fc["args"])]
+                    })
+                else:
+                    # Model returned text
+                    contents.append({"role": "model", "parts": [msg["content"]]})
             elif role == "function":
                 contents.append({
                     "role": "function",
@@ -124,13 +137,28 @@ class GeminiClient:
                 tool_config=tool_config
             )
 
+            # Extract token usage metadata for Langfuse
+            usage_data = None
+            if hasattr(response, 'usage_metadata') and response.usage_metadata:
+                usage_data = {
+                    "input": response.usage_metadata.prompt_token_count,
+                    "output": response.usage_metadata.candidates_token_count
+                    # "total" is auto-calculated by Langfuse
+                }
+                print(f"[LLM] Extracted usage data: {usage_data}")
+            else:
+                print(f"[LLM] Warning: No usage_metadata in response")
+
             # Check for empty response
             if not response.candidates:
                 print(f"[LLM] Warning: No candidates in response")
                 # Check if there's a prompt feedback (safety block, etc.)
                 if hasattr(response, 'prompt_feedback'):
                     print(f"[LLM] Prompt feedback: {response.prompt_feedback}")
-                return {"content": "I was unable to generate a response. The model returned no candidates."}
+                return {
+                    "content": "I was unable to generate a response. The model returned no candidates.",
+                    "usage": usage_data
+                }
 
             candidate = response.candidates[0]
 
@@ -141,12 +169,18 @@ class GeminiClient:
             # Check for empty content
             if not hasattr(candidate, 'content') or not candidate.content:
                 print(f"[LLM] Warning: No content in candidate")
-                return {"content": "I was unable to generate a response. The model returned empty content."}
+                return {
+                    "content": "I was unable to generate a response. The model returned empty content.",
+                    "usage": usage_data
+                }
 
             # Check for empty parts
             if not candidate.content.parts:
                 print(f"[LLM] Warning: No parts in content")
-                return {"content": "I was unable to generate a response. The model returned no parts."}
+                return {
+                    "content": "I was unable to generate a response. The model returned no parts.",
+                    "usage": usage_data
+                }
 
             part = candidate.content.parts[0]
 
@@ -157,16 +191,28 @@ class GeminiClient:
                     "function_call": {
                         "name": func_call.name,
                         "arguments": dict(func_call.args) if func_call.args else {}
-                    }
+                    },
+                    # Store the raw content to preserve thought_signature for replay
+                    "raw_content": candidate.content,
+                    "usage": usage_data
                 }
             elif hasattr(part, 'text') and part.text:
                 print(f"[LLM] Text response: {part.text[:100]}...")
-                return {"content": part.text}
+                return {
+                    "content": part.text,
+                    "usage": usage_data
+                }
             else:
                 try:
-                    return {"content": response.text}
+                    return {
+                        "content": response.text,
+                        "usage": usage_data
+                    }
                 except Exception:
-                    return {"content": "I was unable to generate a response."}
+                    return {
+                        "content": "I was unable to generate a response.",
+                        "usage": usage_data
+                    }
 
         except Exception as e:
             print(f"[LLM] Error in generate_with_tools: {e}")
@@ -352,11 +398,14 @@ class GenerationWrapper:
                 if output is not None:
                     update_kwargs["output"] = output
                 if usage is not None:
-                    update_kwargs["usage"] = usage
+                    print(f"[Langfuse] Updating generation with usage_details: {usage}")
+                    update_kwargs["usage_details"] = usage  # Langfuse expects "usage_details"
                 update_kwargs.update(kwargs)
                 self._generation.update(**update_kwargs)
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Langfuse] Error updating generation: {e}")
+                import traceback
+                traceback.print_exc()
 
     def end(self, output: Any = None, usage: dict | None = None, **kwargs):
         """End is a no-op in v3 API - generations end when context exits."""

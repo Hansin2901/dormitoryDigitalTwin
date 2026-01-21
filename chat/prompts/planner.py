@@ -25,7 +25,7 @@ Most questions require a two-step process. You cannot query InfluxDB with a Room
 1. User asks: "What is the max temperature in room 101?"
 2. First, call `execute_cypher` with query: `MATCH (s:TemperatureSensor)-[:INSTALLED_IN]->(r:Room {room_number: '101'}) RETURN s.sensor_id`
 3. Observe result: `[{'s.sensor_id': 'TEMP-101'}]`
-4. Then, call `execute_sql` with query: `SELECT MAX(reading) FROM sensor_readings WHERE sensor_id = 'TEMP-101' AND time > now() - interval '1 day'`
+4. Then, call `execute_sql` with query: `SELECT MAX(reading) as max_temp, time FROM sensor_readings WHERE sensor_id = 'TEMP-101' ORDER BY time DESC LIMIT 100`
 
 ## Tool Usage Rules
 1. **Always call a tool before answering factual questions.** If the user asks for data about rooms, sensors, AC units, temperatures, or occupancy, you MUST call at least one tool first.
@@ -58,21 +58,29 @@ Most questions require a two-step process. You cannot query InfluxDB with a Room
 
 ### SQL Query Examples
 ```sql
--- Hourly Average
-SELECT DATE_BIN('1 hour', time) as hour_bucket, AVG(reading)
-FROM sensor_readings
-WHERE sensor_id = 'TEMP-101' AND time > now() - interval '1 day'
-GROUP BY 1 ORDER BY 1
-
--- Occupancy percentage (0 or 1 readings)
-SELECT AVG(reading) * 100 as percent_occupied
-FROM sensor_readings
-WHERE sensor_id = 'OCC-101' AND time > now() - interval '1 day'
-
--- Latest reading
+-- Latest/current reading (always use this pattern for "current" values)
 SELECT reading, time FROM sensor_readings
 WHERE sensor_id = 'TEMP-101'
 ORDER BY time DESC LIMIT 1
+
+-- Hourly Average (uses subquery to get relative time from data)
+SELECT DATE_BIN('1 hour', time) as hour_bucket, AVG(reading)
+FROM sensor_readings
+WHERE sensor_id = 'TEMP-101'
+  AND time > (SELECT MAX(time) FROM sensor_readings) - interval '1 day'
+GROUP BY 1 ORDER BY 1
+
+-- Occupancy percentage over available data
+SELECT AVG(reading) * 100 as percent_occupied
+FROM sensor_readings
+WHERE sensor_id = 'OCC-101'
+
+-- Compare multiple sensors (latest readings)
+SELECT sensor_id, reading, time
+FROM sensor_readings
+WHERE sensor_type = 'temperature'
+ORDER BY time DESC
+LIMIT 12
 ```
 
 ## Neo4j Graph Database Schema

@@ -11,6 +11,7 @@ from typing import Any
 from chat.llm import GeminiClient
 from chat.prompts import PLANNER_SYSTEM_PROMPT
 from chat.tools import execute_cypher, execute_sql
+from db import InfluxClient
 
 
 # Tool definitions for Gemini function calling
@@ -86,6 +87,55 @@ class PlannerAgent:
         """Initialize the planner agent with LLM client."""
         self.llm = GeminiClient()
         self.max_iterations = 10
+        self._data_time_range = None
+
+    def _get_data_time_range(self) -> dict:
+        """Fetch and cache the data time range from InfluxDB."""
+        if self._data_time_range is None:
+            try:
+                with InfluxClient() as client:
+                    self._data_time_range = client.get_data_time_range()
+            except Exception as e:
+                print(f"[Agent] Failed to get data time range: {e}")
+                self._data_time_range = {'min_time': None, 'max_time': None, 'latest_time_str': None}
+        return self._data_time_range
+
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt with data time range context."""
+        time_range = self._get_data_time_range()
+
+        if time_range.get('max_time') is not None:
+            time_context = f"""
+## IMPORTANT: Data Time Range
+The sensor data is STATIC and was recorded between:
+- **Start:** {time_range['min_time']}
+- **End:** {time_range['max_time']}
+
+**DO NOT use `now()` in your SQL queries** - it will return current real-world time which is outside the data range and will give empty results.
+
+Instead:
+- For "current" or "latest" readings: Use `ORDER BY time DESC LIMIT 1`
+- For "last hour/day": Use `time > TIMESTAMP '{time_range['max_time']}' - interval '1 hour'`
+- For time ranges: Reference the data end time `'{time_range['max_time']}'` as the "current" moment
+
+Example - Get latest temperature:
+```sql
+SELECT reading, time FROM sensor_readings
+WHERE sensor_id = 'TEMP-101'
+ORDER BY time DESC LIMIT 1
+```
+
+Example - Get average over last day (relative to data end):
+```sql
+SELECT AVG(reading) FROM sensor_readings
+WHERE sensor_id = 'TEMP-101'
+  AND time > TIMESTAMP '{time_range['max_time']}' - interval '1 day'
+```
+"""
+        else:
+            time_context = ""
+
+        return PLANNER_SYSTEM_PROMPT + time_context
 
     def _execute_tool(self, tool_name: str, tool_input: dict, trace: Any = None) -> dict:
         """Execute a tool and return the result (legacy method without tracing)."""
@@ -144,7 +194,8 @@ class PlannerAgent:
         intent_phrases = [
             "i'll use", "i will use", "i'll call", "i will call",
             "let me use", "let me call", "i need to use", "i need to call",
-            "using execute_", "call execute_"
+            "using execute_", "call execute_", "calling execute_",
+            "execute_cypher", "execute_sql"
         ]
         text_lower = text.lower()
         return any(phrase in text_lower for phrase in intent_phrases)
@@ -160,6 +211,9 @@ class PlannerAgent:
 
         response = AgentResponse()
         messages = [{"role": "user", "content": user_query}]
+
+        # Build system prompt with data time range context
+        system_prompt = self._build_system_prompt()
 
         # Use trace as context manager for proper v3 API usage
         with trace:
@@ -177,7 +231,7 @@ class PlannerAgent:
 
                         # Build messages array with system prompt for tracing
                         trace_messages = [
-                            {"role": "system", "content": PLANNER_SYSTEM_PROMPT},
+                            {"role": "system", "content": system_prompt},
                             *[{"role": m["role"], "content": m.get("content", str(m))} for m in messages]
                         ]
 
@@ -189,12 +243,17 @@ class PlannerAgent:
                             metadata={"tools": TOOLS}
                         ) as gen:
                             llm_response = self.llm.generate_with_tools(
-                                system_prompt=PLANNER_SYSTEM_PROMPT,
+                                system_prompt=system_prompt,
                                 messages=messages,
                                 tools=TOOLS,
                                 parent_trace=iter_span
                             )
-                            gen.update(output=llm_response)
+                            usage = llm_response.get("usage")
+                            print(f"[Agent] Passing usage to Langfuse: {usage}")
+                            gen.update(
+                                output=llm_response,
+                                usage=usage
+                            )
 
                         print(f"[Agent] LLM response keys: {llm_response.keys()}")
 
@@ -218,10 +277,17 @@ class PlannerAgent:
 
                             # Add to conversation for next iteration
                             formatted_result = self._format_tool_result(tool_result)
-                            messages.append({
+                            # Store raw_content if available (preserves thought_signature for Gemini)
+                            model_msg = {
                                 "role": "model",
-                                "content": f"Calling {tool_name}"
-                            })
+                                "function_call": {
+                                    "name": tool_name,
+                                    "args": tool_input
+                                }
+                            }
+                            if "raw_content" in llm_response:
+                                model_msg["raw_content"] = llm_response["raw_content"]
+                            messages.append(model_msg)
                             messages.append({
                                 "role": "function",
                                 "name": tool_name,

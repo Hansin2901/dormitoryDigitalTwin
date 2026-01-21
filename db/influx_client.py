@@ -68,6 +68,32 @@ class InfluxClient:
         """Run a SQL query and return results as a pandas DataFrame."""
         return self.client.query(sql)
 
+    def get_data_time_range(self) -> dict:
+        """
+        Get the time range of data in the sensor_readings table.
+
+        Returns:
+            dict with 'min_time', 'max_time', and 'latest_time_str' keys,
+            or None values if query fails.
+        """
+        try:
+            result = self.query("""
+                SELECT MIN(time) as min_time, MAX(time) as max_time
+                FROM sensor_readings
+            """)
+            df = result.to_pandas()
+            if not df.empty:
+                min_time = df['min_time'].iloc[0]
+                max_time = df['max_time'].iloc[0]
+                return {
+                    'min_time': min_time,
+                    'max_time': max_time,
+                    'latest_time_str': str(max_time) if max_time else None
+                }
+        except Exception as e:
+            print(f"Failed to get data time range: {e}")
+        return {'min_time': None, 'max_time': None, 'latest_time_str': None}
+
 
 if __name__ == "__main__":
     with InfluxClient() as client:
